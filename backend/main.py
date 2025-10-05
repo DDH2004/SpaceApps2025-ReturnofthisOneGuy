@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import asyncio
@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime, timedelta
 import redis
 from contextlib import asynccontextmanager
+
+import pandas as pd
 
 def utc_now():
     """Get current UTC datetime"""
@@ -344,6 +346,66 @@ async def get_model_info():
     except Exception as e:
         logger.error(f"Error getting model info: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# New endpoint: CSV upload and batch prediction
+@app.post("/predict/csv")
+async def predict_from_csv(file: UploadFile = File(...)):
+    """Accept a CSV file, run batch predictions, and return results"""
+    try:
+        # Read CSV into DataFrame
+        contents = await file.read()
+        df = pd.read_csv(pd.io.common.BytesIO(contents))
+
+        # Prepare requests for batch prediction
+        predictor = get_predictor()
+        if not predictor.is_loaded:
+            predictor.load_model()
+
+        # Map DataFrame rows to ExoplanetPredictionRequest
+        requests = []
+        # Get feature defaults (medians)
+        feature_defaults = getattr(predictor, 'imputer', None)
+        # If imputer is a SimpleImputer, get statistics_
+        if feature_defaults and hasattr(feature_defaults, 'statistics_'):
+            median_map = dict(zip(predictor.feature_columns, feature_defaults.statistics_))
+        else:
+            # Fallback to FEATURE_DEFAULTS from config
+            from config import FEATURE_DEFAULTS
+            median_map = FEATURE_DEFAULTS
+
+        for _, row in df.iterrows():
+            # Convert row to dict
+            data = {col: row.get(col, None) for col in predictor.feature_columns if col != 'mission_encoded'}
+            # Fill missing values with medians/defaults
+            for col in predictor.feature_columns:
+                if col == 'mission_encoded':
+                    continue
+                if data.get(col) is None or (isinstance(data.get(col), float) and pd.isna(data.get(col))):
+                    data[col] = median_map.get(col, 0.0)
+            # Assume 'mission' column exists or set default
+            if 'mission' not in data:
+                data['mission'] = 'KEPLER'
+            req = ExoplanetPredictionRequest(**data)
+            requests.append(req)
+
+        # Run batch prediction
+        results = predictor.predict_batch(requests)
+
+        # Format output: CONFIRMED or FALSE POSITIVE + confidence
+        output = []
+        for i, res in enumerate(results):
+            label = 'CONFIRMED' if res.prediction == 1 else 'FALSE POSITIVE'
+            output.append({
+                'row': i + 1,
+                'label': label,
+                'confidence_score': res.probability,
+                'confidence_level': res.confidence_level
+            })
+
+        return {'results': output}
+    except Exception as e:
+        logger.error(f"Error processing CSV: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

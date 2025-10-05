@@ -34,16 +34,25 @@ function parseCSV(text: string) {
 }
 
 const REQ_TABULAR_MIN = [
-  "kepid",
-  "koi_period",
-  "koi_depth",
-  "koi_duration",
-  "koi_steff",
-  "koi_srad",
-  "koi_smass",
-  "koi_slogg",
-  "koi_smet",
-  "koi_impact",
+  "id",
+  "mission",
+  "disposition",
+  "label",
+  "orbital_period_days",
+  "transit_duration_hours",
+  "transit_depth_ppm",
+  "planet_radius_re",
+  "equilibrium_temp_k",
+  "insolation_flux_earth",
+  "stellar_teff_k",
+  "stellar_radius_re",
+  "stellar_mass_sun",
+  "stellar_logg_cgs",
+  "stellar_metallicity_fe",
+  "impact_param",
+  "apparent_mag",
+  "ra",
+  "dec"
 ] as const;
 const REQ_MULTIMODAL = [
   "kepid",
@@ -195,8 +204,9 @@ function TabularPanel() {
     const { headers: h, rows: r } = parseCSV(text);
     setHeaders(h);
     setRows(r);
-    if (!REQ_TABULAR_MIN.every((k) => h.includes(k))) {
-      setError(`Missing required columns: ${REQ_TABULAR_MIN.join(", ")}`);
+    const missing = REQ_TABULAR_MIN.filter((k) => !h.includes(k));
+    if (missing.length > 0) {
+      setError(`Warning! There are missing/misnamed columns: ${missing.join(", ")}`);
     }
   };
 
@@ -288,7 +298,7 @@ function TabularPanel() {
             <GlowCard>
               <ColumnHistogram
                 rows={rows}
-                col="koi_period"
+                col="orbital_period_days"
                 title="period"
                 unit=" d"
               />
@@ -296,7 +306,7 @@ function TabularPanel() {
             <GlowCard>
               <ColumnHistogram
                 rows={rows}
-                col="koi_depth"
+                col="transit_depth_ppm"
                 title="depth"
                 unit=" ppm"
               />
@@ -304,7 +314,7 @@ function TabularPanel() {
             <GlowCard>
               <ColumnHistogram
                 rows={rows}
-                col="koi_duration"
+                col="transit_duration_hours"
                 title="duration"
                 unit=" hr"
               />
@@ -312,8 +322,8 @@ function TabularPanel() {
             <GlowCard className="md:col-span-3">
               <ScatterPlot
                 rows={rows}
-                xKey="koi_period"
-                yKey="koi_duration"
+                xKey="orbital_period_days"
+                yKey="transit_duration_hours"
                 selected={selected}
                 title="period vs duration"
                 unitX="d"
@@ -379,7 +389,7 @@ function TabularPanel() {
 
             <button
               onClick={analyze}
-              disabled={selected == null || !haveMin || analyzing}
+              disabled={selected == null || analyzing}
               className="mt-6 px-5 py-3 rounded-2xl bg-white text-black font-medium hover:opacity-90 disabled:opacity-40 transition"
             >
               {analyzing ? "Analyzing…" : "Analyze (tabular-only)"}

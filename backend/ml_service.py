@@ -128,13 +128,16 @@ class ExoplanetPredictor:
         try:
             # Preprocess input
             features = self.preprocess_data(request)
+            logger.debug(f"Input features for prediction: {features}")
             
             # Make prediction
             prediction = self.model.predict(features)[0]
             probability = self.model.predict_proba(features)[0]
+            logger.debug(f"Raw model.predict_proba output: {probability}")
             
             # Get probability for the positive class (exoplanet)
             exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
+            logger.info(f"Prediction: {prediction}, Probability: {exoplanet_probability}")
             
             # Determine confidence level
             confidence_level = self._get_confidence_level(exoplanet_probability)
@@ -162,33 +165,41 @@ class ExoplanetPredictor:
         try:
             # Preprocess all requests
             features_list = []
-            for request in requests:
+            for idx, request in enumerate(requests):
                 features = self.preprocess_data(request)
+                logger.debug(f"Batch input features [{idx}]: {features}")
                 features_list.append(features[0])  # Remove the reshape dimension
-            
+
             # Convert to numpy array
             all_features = np.array(features_list)
-            
+            logger.debug(f"All batch features shape: {all_features.shape}")
+            # Check for all-constant or all-default features
+            if np.all(all_features == all_features[0]):
+                logger.warning("All batch input features are identical. This may cause uniform predictions.")
+
             # Make batch predictions
             start_time = time.time()
             predictions = self.model.predict(all_features)
             probabilities = self.model.predict_proba(all_features)
+            logger.debug(f"Batch raw model.predict_proba output: {probabilities}")
             processing_time = (time.time() - start_time) * 1000
-            
+
             # Process results
             for i, (prediction, probability) in enumerate(zip(predictions, probabilities)):
+                logger.debug(f"Row {i} probability array: {probability}")
                 exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
+                logger.info(f"Batch Prediction [{i}]: {prediction}, Probability: {exoplanet_probability}")
                 confidence_level = self._get_confidence_level(exoplanet_probability)
-                
+
                 results.append(PredictionResult(
                     prediction=int(prediction),
                     probability=float(exoplanet_probability),
                     confidence_level=confidence_level,
                     processing_time_ms=processing_time / len(requests)  # Average time per prediction
                 ))
-            
+
             return results
-            
+
         except Exception as e:
             logger.error(f"Error making batch predictions: {e}")
             raise

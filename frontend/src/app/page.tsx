@@ -6,6 +6,7 @@ import { motion } from "framer-motion";
 import { Hero } from "@/components/Hero";
 import { ExoDotsCanvas } from "@/components/ExoDotsCanvas";
 import { Header } from "@/components/Header";
+import CsvUploadPredictor from "@/components/CsvUploadPredictor";
 
 export default function Page() {
   const heroRef = useRef<HTMLDivElement>(null);
@@ -40,6 +41,9 @@ export default function Page() {
             transition={{ duration: 0.8, ease: "easeOut", delay: 1 }}
           >
             <Hero />
+              <div className="mt-10">
+                <CsvUploadPredictor />
+              </div>
           </motion.div>
         </div>
       </motion.div>

@@ -1,0 +1,13 @@
+ORB_PERIOD
+transit_duration_hours
+TRANSIT_DEPTH
+PLANET_RADIUS
+equilibrium_temp_k
+INSOL_FLUX
+stellar_teff_k
+STELLAR_RADIUS
+apparent_mag
+ra
+dec
+R_PLANET_R_STAR_RATIO
+DEPTH_PER_RADIUS
