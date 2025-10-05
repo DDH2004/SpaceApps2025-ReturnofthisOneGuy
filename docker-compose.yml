@@ -71,21 +71,6 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-
-  # Next.js Frontend (optional - can run separately)
-  frontend:
-    build: 
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: exoplanet_frontend
-    ports:
-      - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
-      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-
+      
 volumes:
   redis_data:

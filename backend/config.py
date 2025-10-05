@@ -23,7 +23,7 @@ WEBSOCKET_PATH = "/ws"
 CORS_ORIGINS = [
     "http://localhost:3000",  # Next.js development server
     "http://localhost:3001",
-    "https://your-frontend-domain.com",  # Add your production domain
+    "http://localhost:3002",
 ]
 
 # Worker Configuration
@@ -38,8 +38,20 @@ FEATURE_COLUMNS_PATH = os.getenv("FEATURE_COLUMNS_PATH", "./AI_Model_Forest/trai
 LABEL_ENCODER_PATH = os.getenv("LABEL_ENCODER_PATH", "./AI_Model_Forest/trained_model/label_encoder_combined.joblib")
 IMPUTER_PATH = os.getenv("IMPUTER_PATH", "./AI_Model_Forest/trained_model/imputer_medians_combined.joblib")
 
+# Paths for the PyTorch multimodal models (from the exoplanet-detection-pipeline)
+# Use absolute paths by default to avoid relative path resolution issues when launching uvicorn
+DEFAULT_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+EXO_PIPELINE_ROOT = os.getenv("EXO_PIPELINE_ROOT", os.path.abspath(os.path.join(DEFAULT_REPO_ROOT, "exoplanet-detection-pipeline")))
+EXO_MODELS_DIR = os.path.join(EXO_PIPELINE_ROOT, "models")
+# Allow overriding via env vars but default to absolute paths inside the repo
+TABULAR_TORCH_MODEL = os.getenv("TABULAR_TORCH_MODEL", os.path.join(EXO_MODELS_DIR, "tabular_model.pth"))
+ENHANCED_FUSION_MODEL = os.getenv("ENHANCED_FUSION_MODEL", os.path.join(EXO_MODELS_DIR, "enhanced_multimodal_fusion_model.pth"))
+
+# Default tabular feature count used by the exoplanet pipeline
+EXO_TABULAR_FEATURES = int(os.getenv("EXO_TABULAR_FEATURES", 39))
+
 # Task Configuration
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 1000))
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 10000))
 DEFAULT_TASK_TIMEOUT = int(os.getenv("DEFAULT_TASK_TIMEOUT", 120))  # 2 minutes
 TASK_RETENTION_HOURS = int(os.getenv("TASK_RETENTION_HOURS", 24))  # Keep results for 24 hours
 

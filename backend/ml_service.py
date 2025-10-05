@@ -1,237 +1,244 @@
+import os
 import numpy as np
-import pandas as pd
-import joblib
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
-from typing import List, Dict, Any, Tuple
 import logging
+from typing import List, Any
 from pathlib import Path
-import time
+import io
 
-from models import ExoplanetPredictionRequest, PredictionResult
-from config import MODEL_PATH, PREPROCESSOR_PATH, FEATURE_COLUMNS_PATH, FEATURE_DEFAULTS, LABEL_ENCODER_PATH, IMPUTER_PATH
+from models import ExoplanetPredictionRequest
+from config import (
+    FEATURE_DEFAULTS,
+    TABULAR_TORCH_MODEL,
+    ENHANCED_FUSION_MODEL,
+    EXO_TABULAR_FEATURES,
+)
+
+import torch
+from PIL import Image
+import importlib.util
 
 logger = logging.getLogger(__name__)
 
-class ExoplanetPredictor:
-    """
-    Exoplanet prediction service using Random Forest model
-    """
-    
+
+class TorchModelManager:
+    """Manager for loading PyTorch models from the exoplanet pipeline and running inference."""
+
     def __init__(self):
-        self.model: RandomForestClassifier = None
-        self.scaler: StandardScaler = None
-        self.label_encoder = None
-        self.imputer = None
-        self.feature_columns: List[str] = []
+        self.tabular_model = None
+        self.fusion_model = None
+        self.device = torch.device('cpu')
+        self.tabular_input_size = EXO_TABULAR_FEATURES
         self.is_loaded = False
-        
-    def load_model(self) -> bool:
-        """Load the trained Random Forest model and all preprocessing components"""
+
+    def load_tabular_model(self, path: str = TABULAR_TORCH_MODEL) -> bool:
         try:
-            # Load Random Forest model
-            if Path(MODEL_PATH).exists():
-                self.model = joblib.load(MODEL_PATH)
-                logger.info(f"Random Forest model loaded from {MODEL_PATH}")
-            else:
-                logger.error(f"Model file not found: {MODEL_PATH}")
+            if not Path(path).exists():
+                logger.error(f"Tabular torch model not found: {path}")
                 return False
-            
-            # Load scaler
-            if Path(PREPROCESSOR_PATH).exists():
-                self.scaler = joblib.load(PREPROCESSOR_PATH)
-                logger.info(f"Scaler loaded from {PREPROCESSOR_PATH}")
+            # Dynamically import the TabularNet class from the repo's src/models.py
+            models_py = Path(path).parents[1] / 'src' / 'models.py'
+            if not models_py.exists():
+                logger.error(f"Cannot find models.py at expected location: {models_py}")
+                return False
+
+            spec = importlib.util.spec_from_file_location('exo_models', str(models_py))
+            exo_models = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(exo_models)  # type: ignore
+
+            TabularNet = getattr(exo_models, 'TabularNet')
+
+            model = TabularNet(input_size=self.tabular_input_size)
+            state = torch.load(path, map_location=self.device)
+            # Allow both state_dict or full model
+            if isinstance(state, dict):
+                # state is a state_dict -> load into model
+                try:
+                    model.load_state_dict(state)
+                except Exception as e:
+                    logger.error(f"Failed to load state_dict into TabularNet: {e}")
+                    return False
+            elif isinstance(state, torch.nn.Module):
+                # saved full model object
+                model = state
             else:
-                logger.warning(f"Scaler file not found: {PREPROCESSOR_PATH}")
-                self.scaler = StandardScaler()
-            
-            # Load label encoder
-            if Path(LABEL_ENCODER_PATH).exists():
-                self.label_encoder = joblib.load(LABEL_ENCODER_PATH)
-                logger.info(f"Label encoder loaded from {LABEL_ENCODER_PATH}")
-            else:
-                logger.warning(f"Label encoder file not found: {LABEL_ENCODER_PATH}")
-            
-            # Load imputer
-            if Path(IMPUTER_PATH).exists():
-                self.imputer = joblib.load(IMPUTER_PATH)
-                logger.info(f"Imputer loaded from {IMPUTER_PATH}")
-            else:
-                logger.warning(f"Imputer file not found: {IMPUTER_PATH}")
-            
-            # Load feature columns
-            if Path(FEATURE_COLUMNS_PATH).exists():
-                with open(FEATURE_COLUMNS_PATH, 'r') as f:
-                    self.feature_columns = [line.strip() for line in f.readlines()]
-                logger.info(f"Feature columns loaded: {len(self.feature_columns)} features")
-            else:
-                # Default feature columns based on your data
-                self.feature_columns = [
-                    'orbital_period_days', 'transit_duration_hours', 'transit_depth_ppm',
-                    'planet_radius_re', 'equilibrium_temp_k', 'insolation_flux_earth',
-                    'stellar_teff_k', 'stellar_radius_re', 'apparent_mag', 'ra', 'dec',
-                    'mission_encoded'
-                ]
-                logger.warning("Using default feature columns")
-            
-            self.is_loaded = True
-            logger.info("Exoplanet predictor loaded successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            return False
-    
-    def preprocess_data(self, request: ExoplanetPredictionRequest) -> np.ndarray:
-        """Preprocess input data for prediction"""
-        try:
-            # Convert request to dictionary
-            data = request.dict()
-            
-            # Fill missing values with defaults
-            for field, default_value in FEATURE_DEFAULTS.items():
-                if data.get(field) is None:
-                    data[field] = default_value
-            
-            # Encode mission (Kepler=0, TESS=1)
-            mission_encoded = 1 if data['mission'].upper() == 'TESS' else 0
-            data['mission_encoded'] = mission_encoded
-            
-            # Create feature vector in the correct order
-            feature_vector = []
-            for column in self.feature_columns:
-                if column == 'mission_encoded':
-                    feature_vector.append(mission_encoded)
+                logger.error(f"Unrecognized tabular model file contents: {type(state)}")
+                return False
+
+            model.to(self.device)
+            model.eval()
+            self.tabular_model = model
+            # Try to infer the expected input size from the model's first Linear layer
+            try:
+                inferred_size = None
+                for m in model.modules():
+                    if isinstance(m, torch.nn.Linear):
+                        inferred_size = int(m.in_features)
+                        break
+                if inferred_size is not None:
+                    self.tabular_input_size = inferred_size
+                    logger.info(f"Inferred tabular input size: {self.tabular_input_size}")
                 else:
-                    feature_vector.append(data.get(column, FEATURE_DEFAULTS.get(column, 0.0)))
-            
-            # Convert to numpy array and reshape
-            features = np.array(feature_vector).reshape(1, -1)
-            
-            # Apply preprocessing if available
-            if self.preprocessor is not None and hasattr(self.preprocessor, 'transform'):
-                features = self.preprocessor.transform(features)
-            
-            return features
-            
+                    logger.info(f"Could not infer tabular input size; using default {self.tabular_input_size}")
+            except Exception as e:
+                logger.warning(f"Failed to infer tabular input size: {e}")
+            self.is_loaded = True
+            logger.info(f"Loaded tabular torch model from {path}")
+            return True
         except Exception as e:
-            logger.error(f"Error preprocessing data: {e}")
-            raise
-    
-    def predict_single(self, request: ExoplanetPredictionRequest) -> PredictionResult:
-        """Make a single prediction"""
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
-        
-        start_time = time.time()
-        
+            logger.error(f"Failed to load tabular torch model: {e}")
+            return False
+
+    def load_fusion_model(self, path: str = ENHANCED_FUSION_MODEL) -> bool:
         try:
-            # Preprocess input
-            features = self.preprocess_data(request)
-            
-            # Make prediction
-            prediction = self.model.predict(features)[0]
-            probability = self.model.predict_proba(features)[0]
-            
-            # Get probability for the positive class (exoplanet)
-            exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
-            
-            # Determine confidence level
-            confidence_level = self._get_confidence_level(exoplanet_probability)
-            
-            processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
-            
-            return PredictionResult(
-                prediction=int(prediction),
-                probability=float(exoplanet_probability),
-                confidence_level=confidence_level,
-                processing_time_ms=processing_time
-            )
-            
+            if not Path(path).exists():
+                logger.error(f"Fusion model not found: {path}")
+                return False
+            # Dynamically import HybridEnsemble from src/models.py
+            models_py = Path(path).parents[1] / 'src' / 'models.py'
+            if not models_py.exists():
+                logger.error(f"Cannot find models.py at expected location: {models_py}")
+                return False
+
+            spec = importlib.util.spec_from_file_location('exo_models', str(models_py))
+            exo_models = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(exo_models)  # type: ignore
+
+            HybridEnsemble = getattr(exo_models, 'HybridEnsemble')
+
+            model = HybridEnsemble(tabular_size=self.tabular_input_size)
+            state = torch.load(path, map_location=self.device)
+            if isinstance(state, dict):
+                try:
+                    model.load_state_dict(state)
+                except Exception as e:
+                    logger.error(f"Failed to load state_dict into HybridEnsemble: {e}")
+                    return False
+            elif isinstance(state, torch.nn.Module):
+                model = state
+            else:
+                logger.error(f"Unrecognized fusion model file contents: {type(state)}")
+                return False
+
+            model.to(self.device)
+            model.eval()
+            self.fusion_model = model
+            self.is_loaded = True
+            logger.info(f"Loaded fusion torch model from {path}")
+            return True
         except Exception as e:
-            logger.error(f"Error making prediction: {e}")
-            raise
-    
-    def predict_batch(self, requests: List[ExoplanetPredictionRequest]) -> List[PredictionResult]:
-        """Make batch predictions"""
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load_model() first.")
-        
-        results = []
-        
+            logger.error(f"Failed to load fusion model: {e}")
+            return False
+
+    def predict_tabular_array(self, features: List[float]) -> float:
+        """Predict probability from a tabular feature list using the tabular model."""
+        if self.tabular_model is None:
+            raise RuntimeError("Tabular model not loaded")
+        with torch.no_grad():
+            tensor = torch.FloatTensor(features).view(1, -1).to(self.device)
+            out = self.tabular_model(tensor)
+            # If model outputs logits, apply sigmoid
+            try:
+                prob = torch.sigmoid(out).item()
+            except Exception:
+                prob = float(out.squeeze().cpu().numpy())
+            return prob
+
+    def predict_fusion(self, tabular_features: List[float], image_bytes: bytes = None) -> float:
+        """Predict using fusion model; image_bytes is optional pixel-diff heatmap (png/jpg).
+        If image_bytes is None, pass zeros for cnn inputs."""
+        if self.fusion_model is None:
+            raise RuntimeError("Fusion model not loaded")
+
+        # Prepare tensors
+        tab = torch.FloatTensor(tabular_features).view(1, -1).to(self.device)
+
+        # Default cnn inputs
+        cnn1d = torch.zeros(1, 5, 128, dtype=torch.float32).to(self.device)
+        cnn2d = torch.zeros(1, 32, 24, 24, dtype=torch.float32).to(self.device)
+
+        if image_bytes is not None:
+            try:
+                img = Image.open(io.BytesIO(image_bytes)).convert('L')
+                arr = np.array(img, dtype=np.float32) / 255.0
+                # Resize or pad to (24,24) and expand to phases dim if needed
+                from skimage.transform import resize
+                small = resize(arr, (24, 24), preserve_range=True)
+                # Create fake phases dimension by repeating
+                phases = np.stack([small for _ in range(32)], axis=0)  # (32,24,24)
+                cnn2d = torch.FloatTensor(phases).unsqueeze(0).to(self.device)
+            except Exception as e:
+                logger.warning(f"Failed to process image for fusion model: {e}")
+
+        with torch.no_grad():
+            out, _ = self.fusion_model(tab, cnn1d, cnn2d)
+            try:
+                prob = torch.sigmoid(out).item()
+            except Exception:
+                prob = float(out.squeeze().cpu().numpy())
+            return prob
+
+
+# Global torch manager
+torch_manager = TorchModelManager()
+
+def initialize_torch_models() -> bool:
+    # By default only load the tabular model (fusion models are large and
+    # may have mismatched checkpoints). Set USE_FUSION=true in the env to
+    # attempt to load the fusion model as well.
+    ok_tab = torch_manager.load_tabular_model()
+    use_fusion = str(os.getenv("USE_FUSION", "False")).lower() in ("1", "true", "yes")
+    ok_fusion = False
+    if use_fusion:
+        ok_fusion = torch_manager.load_fusion_model()
+    return ok_tab or ok_fusion
+
+def get_torch_manager() -> TorchModelManager:
+    return torch_manager
+
+
+def request_to_feature_list(request_data: Any, target_length: int = None) -> List[float]:
+    """Convert a dict or ExoplanetPredictionRequest to a numeric feature list.
+    This is a best-effort mapping: it will take numeric fields in insertion order,
+    encode `mission` to 0/1 (Kepler=0, TESS=1) and pad/truncate to target_length.
+    """
+    if target_length is None:
+        target_length = EXO_TABULAR_FEATURES
+
+    # If this is a Pydantic model, get dict
+    if hasattr(request_data, 'dict'):
+        data = request_data.dict()
+    elif isinstance(request_data, dict):
+        data = request_data
+    else:
+        raise ValueError('Unsupported request data type')
+
+    features: List[float] = []
+
+    # Handle mission encoding first if present
+    if 'mission' in data:
         try:
-            # Preprocess all requests
-            features_list = []
-            for request in requests:
-                features = self.preprocess_data(request)
-                features_list.append(features[0])  # Remove the reshape dimension
-            
-            # Convert to numpy array
-            all_features = np.array(features_list)
-            
-            # Make batch predictions
-            start_time = time.time()
-            predictions = self.model.predict(all_features)
-            probabilities = self.model.predict_proba(all_features)
-            processing_time = (time.time() - start_time) * 1000
-            
-            # Process results
-            for i, (prediction, probability) in enumerate(zip(predictions, probabilities)):
-                exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
-                confidence_level = self._get_confidence_level(exoplanet_probability)
-                
-                results.append(PredictionResult(
-                    prediction=int(prediction),
-                    probability=float(exoplanet_probability),
-                    confidence_level=confidence_level,
-                    processing_time_ms=processing_time / len(requests)  # Average time per prediction
-                ))
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error making batch predictions: {e}")
-            raise
-    
-    def _get_confidence_level(self, probability: float) -> str:
-        """Determine confidence level based on probability"""
-        if probability >= 0.8 or probability <= 0.2:
-            return "High"
-        elif probability >= 0.6 or probability <= 0.4:
-            return "Medium"
+            features.append(1.0 if str(data.get('mission', '')).upper() == 'TESS' else 0.0)
+        except Exception:
+            features.append(0.0)
+
+    # Then iterate other numeric fields
+    for k, v in data.items():
+        if k == 'mission':
+            continue
+        if isinstance(v, (int, float)):
+            features.append(float(v))
         else:
-            return "Low"
-    
-    def get_model_info(self) -> Dict[str, Any]:
-        """Get information about the loaded model"""
-        if not self.is_loaded:
-            return {"error": "Model not loaded"}
-        
-        info = {
-            "model_type": "RandomForestClassifier",
-            "is_loaded": self.is_loaded,
-            "feature_count": len(self.feature_columns),
-            "feature_columns": self.feature_columns
-        }
-        
-        if hasattr(self.model, 'n_estimators'):
-            info["n_estimators"] = self.model.n_estimators
-        
-        if hasattr(self.model, 'feature_importances_'):
-            feature_importance = dict(zip(self.feature_columns, self.model.feature_importances_))
-            # Sort by importance
-            info["feature_importance"] = dict(sorted(feature_importance.items(), 
-                                                   key=lambda x: x[1], reverse=True))
-        
-        return info
+            # Attempt coercion
+            try:
+                features.append(float(v))
+            except Exception:
+                # fallback to default if available
+                features.append(float(FEATURE_DEFAULTS.get(k, 0.0)))
 
-# Global predictor instance
-predictor = ExoplanetPredictor()
+    # Pad or truncate
+    if len(features) < target_length:
+        features += [0.0] * (target_length - len(features))
+    elif len(features) > target_length:
+        features = features[:target_length]
 
-def initialize_predictor() -> bool:
-    """Initialize the global predictor instance"""
-    return predictor.load_model()
-
-def get_predictor() -> ExoplanetPredictor:
-    """Get the global predictor instance"""
-    return predictor
+    return features

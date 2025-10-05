@@ -7,7 +7,7 @@ from datetime import datetime
 
 from config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND
 from models import ExoplanetPredictionRequest, PredictionResult, TaskTelemetry, TaskStatus
-from ml_service import get_predictor
+from ml_service import get_torch_manager, request_to_feature_list, initialize_torch_models
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,81 +41,67 @@ def predict_single_exoplanet(self, prediction_data: Dict[str, Any]) -> Dict[str,
     """
     task_id = self.request.id
     logger.info(f"Starting prediction task {task_id}")
-    
+
     try:
-        # Update task status
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 10,
-                'message': 'Initializing prediction...'
-            }
-        )
-        
-        # Get predictor instance
-        predictor = get_predictor()
-        if not predictor.is_loaded:
-            if not predictor.load_model():
-                raise Exception("Failed to load ML model")
-        
-        # Update progress
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 30,
-                'message': 'Model loaded, preparing data...'
-            }
-        )
-        
+        # initial state
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 10,
+            'message': 'Initializing prediction...'
+        })
+
+        # Load models
+        initialize_torch_models()
+        manager = get_torch_manager()
+
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 30,
+            'message': 'Model loaded, preparing data...'
+        })
+
         # Create prediction request
         request = ExoplanetPredictionRequest(**prediction_data)
-        
-        # Update progress
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 60,
-                'message': 'Making prediction...'
-            }
-        )
-        
-        # Make prediction
-        result = predictor.predict_single(request)
-        
-        # Update progress
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 90,
-                'message': 'Finalizing results...'
-            }
-        )
-        
+
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 60,
+            'message': 'Making prediction...'
+        })
+
+        # Predict
+        features = request_to_feature_list(request, target_length=manager.tabular_input_size)
+        prob = manager.predict_tabular_array(features)
+
+        result = {
+            'prediction': int(prob > 0.5),
+            'probability': float(prob),
+            'confidence_level': 'High' if prob >= 0.8 or prob <= 0.2 else 'Medium' if prob >= 0.6 or prob <= 0.4 else 'Low',
+            'processing_time_ms': 0.0
+        }
+
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 90,
+            'message': 'Finalizing results...'
+        })
+
         logger.info(f"Prediction completed for task {task_id}")
-        
+
         return {
             'status': TaskStatus.COMPLETED.value,
-            'result': result.dict(),
+            'result': result,
             'task_id': task_id,
             'completed_at': datetime.utcnow().isoformat()
         }
-        
+
     except Exception as e:
         logger.error(f"Error in prediction task {task_id}: {str(e)}")
-        
-        self.update_state(
-            state=TaskStatus.FAILED.value,
-            meta={
-                'status': TaskStatus.FAILED.value,
-                'error': str(e),
-                'task_id': task_id
-            }
-        )
-        
+        self.update_state(state=TaskStatus.FAILED.value, meta={
+            'status': TaskStatus.FAILED.value,
+            'error': str(e),
+            'task_id': task_id
+        })
         raise e
 
 @celery_app.task(bind=True, name='predict_batch_exoplanets')
@@ -131,94 +117,80 @@ def predict_batch_exoplanets(self, batch_data: List[Dict[str, Any]], batch_id: s
     
     try:
         # Update task status
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 5,
-                'message': f'Initializing batch prediction for {total_predictions} items...',
-                'batch_id': batch_id,
-                'total_items': total_predictions
-            }
-        )
-        
-        # Get predictor instance
-        predictor = get_predictor()
-        if not predictor.is_loaded:
-            if not predictor.load_model():
-                raise Exception("Failed to load ML model")
-        
-        # Update progress
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
-                'status': TaskStatus.PROCESSING.value,
-                'progress': 15,
-                'message': 'Model loaded, preparing batch data...',
-                'batch_id': batch_id
-            }
-        )
-        
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 5,
+            'message': f'Initializing batch prediction for {total_predictions} items...',
+            'batch_id': batch_id,
+            'total_items': total_predictions
+        })
+
+        # Ensure torch models loaded
+        initialize_torch_models()
+        manager = get_torch_manager()
+
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 15,
+            'message': 'Model loaded, preparing batch data...',
+            'batch_id': batch_id
+        })
+
         # Create prediction requests
         requests = [ExoplanetPredictionRequest(**data) for data in batch_data]
-        
+
         # Process in smaller chunks for better progress updates
         chunk_size = min(100, max(1, total_predictions // 10))
         results = []
-        
+
         for i in range(0, len(requests), chunk_size):
             chunk = requests[i:i + chunk_size]
-            chunk_results = predictor.predict_batch(chunk)
-            results.extend(chunk_results)
-            
+            # For each request in chunk, convert to features and predict
+            for req in chunk:
+                features = request_to_feature_list(req, target_length=manager.tabular_input_size)
+                prob = manager.predict_tabular_array(features)
+                results.append({
+                    'prediction': int(prob > 0.5),
+                    'probability': float(prob)
+                })
+
             # Update progress
             progress = 15 + (70 * (i + len(chunk)) / total_predictions)
-            self.update_state(
-                state=TaskStatus.PROCESSING.value,
-                meta={
-                    'status': TaskStatus.PROCESSING.value,
-                    'progress': int(progress),
-                    'message': f'Processed {i + len(chunk)}/{total_predictions} predictions...',
-                    'batch_id': batch_id,
-                    'completed_items': i + len(chunk)
-                }
-            )
-        
-        # Final update
-        self.update_state(
-            state=TaskStatus.PROCESSING.value,
-            meta={
+            self.update_state(state=TaskStatus.PROCESSING.value, meta={
                 'status': TaskStatus.PROCESSING.value,
-                'progress': 95,
-                'message': 'Finalizing batch results...',
-                'batch_id': batch_id
-            }
-        )
-        
+                'progress': int(progress),
+                'message': f'Processed {i + len(chunk)}/{total_predictions} predictions...',
+                'batch_id': batch_id,
+                'completed_items': i + len(chunk)
+            })
+
+        # Final update
+        self.update_state(state=TaskStatus.PROCESSING.value, meta={
+            'status': TaskStatus.PROCESSING.value,
+            'progress': 95,
+            'message': 'Finalizing batch results...',
+            'batch_id': batch_id
+        })
+
         logger.info(f"Batch prediction completed for task {task_id}")
-        
+
         return {
             'status': TaskStatus.COMPLETED.value,
-            'results': [result.dict() for result in results],
+            'results': results,
             'batch_id': batch_id,
             'task_id': task_id,
             'total_processed': len(results),
             'completed_at': datetime.utcnow().isoformat()
         }
-        
+
     except Exception as e:
         logger.error(f"Error in batch prediction task {task_id}: {str(e)}")
-        
-        self.update_state(
-            state=TaskStatus.FAILED.value,
-            meta={
-                'status': TaskStatus.FAILED.value,
-                'error': str(e),
-                'task_id': task_id,
-                'batch_id': batch_id
-            }
-        )
-        
+        self.update_state(state=TaskStatus.FAILED.value, meta={
+            'status': TaskStatus.FAILED.value,
+            'error': str(e),
+            'task_id': task_id,
+            'batch_id': batch_id
+        })
         raise e
 
 @celery_app.task(name='health_check')
@@ -227,8 +199,9 @@ def health_check() -> Dict[str, Any]:
     Health check task for workers
     """
     try:
-        predictor = get_predictor()
-        model_status = predictor.is_loaded
+        initialize_torch_models()
+        manager = get_torch_manager()
+        model_status = manager.is_loaded
         
         return {
             'status': 'healthy',

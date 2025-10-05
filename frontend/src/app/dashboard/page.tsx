@@ -1,248 +1,73 @@
 "use client";
 
-import React, { useMemo, useRef, useState } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { Header } from "@/components/Header";
 import { ExoDotsCanvas } from "@/components/ExoDotsCanvas";
 import { motion } from "framer-motion";
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-  CartesianGrid,
-} from "recharts";
 import Link from "next/link";
+import { v4 as uuidv4 } from 'uuid'; 
 
-type Row = { time: number; flux: number; flux_err?: number };
-type Features = {
-  // stats
-  flux_mean: number;
-  flux_std: number;
-  flux_median: number;
-  flux_mad: number;
-  flux_skew: number;
-  flux_kurtosis: number;
-  flux_range: number;
-  flux_iqr: number;
-  flux_rms: number;
-  // period-ish
-  best_period: number;
-  bls_power: number;
-  period_error: number;
-  // data quality
-  n_points: number;
-  time_span: number;
-  cadence_median: number;
-  cadence_std: number;
-  // transit
-  transit_depth: number;
-  transit_significance: number;
+// --- MODEL INPUT SCHEMAS ---
+type FeatureInput = {
+  orbital_period_days: number | "";
+  transit_duration_hours: number | "";
+  transit_depth_ppm: number | "";
+  planet_radius_re: number | "";
+  equilibrium_temp_k: number | "";
+  insolation_flux_earth: number | "";
+  stellar_teff_k: number | "";
+  stellar_radius_re: number | "";
+  apparent_mag: number | "";
+  ra: number | "";
+  dec: number | "";
 };
-type Output = { predicted_label: 0 | 1; predicted_proba: number };
 
-const median = (a: number[]) => {
-  const s = [...a].sort((x, y) => x - y);
-  const m = Math.floor(s.length / 2);
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+type PredictionOutput = { 
+  Predicted_Disposition: 'CONFIRMED' | 'FALSE POSITIVE'; 
+  Confidence_Confirmed: number;
+  Confidence_False_Positive: number;
 };
-const mean = (a: number[]) => a.reduce((s, v) => s + v, 0) / a.length;
-const std = (a: number[]) => {
-  const m = mean(a);
-  return Math.sqrt(mean(a.map((v) => (v - m) ** 2)));
-};
-const mad = (a: number[]) => median(a.map((v) => Math.abs(v - median(a))));
-const iqr = (a: number[]) => {
-  const s = [...a].sort((x, y) => x - y);
-  const q1 = s[Math.floor(0.25 * (s.length - 1))];
-  const q3 = s[Math.floor(0.75 * (s.length - 1))];
-  return q3 - q1;
-};
-const skew = (a: number[]) => {
-  const m = mean(a),
-    sd = std(a) || 1;
-  return mean(a.map((v) => ((v - m) / sd) ** 3));
-};
-const kurtosis = (a: number[]) => {
-  const m = mean(a),
-    sd = std(a) || 1;
-  return mean(a.map((v) => ((v - m) / sd) ** 4));
-};
-const clamp = (x: number, min: number, max: number) =>
-  Math.max(min, Math.min(max, x));
 
-function parseCSV(text: string): Row[] {
-  const lines = text.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(",").map((h) => h.trim().toLowerCase());
-  const tIdx = headers.indexOf("time");
-  const fIdx = headers.indexOf("flux");
-  const eIdx = headers.indexOf("flux_err");
-  if (tIdx < 0 || fIdx < 0)
-    throw new Error("CSV must include headers: time, flux[, flux_err]");
-  const rows: Row[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(",");
-    const time = parseFloat(cols[tIdx]);
-    const flux = parseFloat(cols[fIdx]);
-    const flux_err = eIdx >= 0 ? parseFloat(cols[eIdx]) : undefined;
-    if (!Number.isFinite(time) || !Number.isFinite(flux)) continue;
-    rows.push({ time, flux, flux_err });
-  }
-  return rows;
+// --- Initial state for the manual input form ---
+const INITIAL_INPUT: FeatureInput = {
+  orbital_period_days: 10.5,
+  transit_duration_hours: 2.5,
+  transit_depth_ppm: 600,
+  planet_radius_re: 2.2,
+  equilibrium_temp_k: 750,
+  insolation_flux_earth: 90,
+  stellar_teff_k: 5500,
+  stellar_radius_re: 0.9,
+  apparent_mag: 15.0,
+  ra: 285.5,
+  dec: 48.2,
+};
+
+// --- Utility Functions ---
+const clamp = (x: number, min: number, max: number) => Math.max(min, Math.min(max, x));
+function fmtNum(n: number) {
+  if (!Number.isFinite(n)) return "—";
+  if (Math.abs(n) >= 1000) return n.toFixed(0);
+  return Number.isInteger(n) ? n.toString() : n.toFixed(4);
 }
 
-/* ============================
-   Detrend (simple rolling median)
-============================= */
-function rollingMedianDetrend(rows: Row[], win = 51): Row[] {
-  if (rows.length === 0) return [];
-  const y = rows.map((r) => r.flux);
-  const half = Math.max(1, Math.floor(win / 2));
-  const trend: number[] = y.map((_, i) => {
-    const s = Math.max(0, i - half),
-      e = Math.min(y.length - 1, i + half);
-    return median(y.slice(s, e + 1));
-  });
-  return rows.map((r, i) => ({
-    ...r,
-    flux_detrended: r.flux / (trend[i] || 1),
-  }));
-}
-
-function estimatePeriodViaACF(rows: Row[]): {
-  best_period: number;
-  power: number;
-  width: number;
-} {
-  if (rows.length < 50) return { best_period: NaN, power: 0, width: 0 };
-  const times = rows.map((r) => r.time);
-  const y = rows.map((r) => r.flux);
-  const dt = median(times.slice(1).map((t, i) => t - times[i]));
-  const N = Math.min(5000, y.length);
-  const y0 = y.slice(0, N);
-  const m = mean(y0);
-  const sd = std(y0) || 1;
-  const norm = y0.map((v) => (v - m) / sd);
-  const maxLag = Math.min(Math.floor(N / 3), 2000);
-  let bestLag = 0,
-    best = -Infinity,
-    bestW = 0;
-  for (let lag = 5; lag < maxLag; lag++) {
-    let s = 0;
-    let c = 0;
-    for (let i = lag; i < norm.length; i++) {
-      s += norm[i] * norm[i - lag];
-      c++;
-    }
-    const corr = s / (c || 1);
-    if (corr > best) {
-      best = corr;
-      bestLag = lag;
-      bestW = 5;
-    }
-  }
-  const period = bestLag * dt;
-  const power = clamp((best + 1) / 2, 0, 1); // normalize -inf..inf -> 0..1-ish
-  const width = bestW * dt * 0.1;
-  return { best_period: period, power, width };
-}
-
-/* ============================
-   Features (18)
-============================= */
-function computeFeatures(rows: Row[]): Features {
-  const t = rows.map((r) => r.time);
-  const y = rows.map((r) => r.flux);
-  const yMed = median(y);
-  const yCentered = y.map((v) => v - yMed);
-
-  // Stats
-  const flux_mean = mean(y);
-  const flux_std = std(y);
-  const flux_median = yMed;
-  const flux_mad = mad(y);
-  const flux_skew = skew(y);
-  const flux_kurtosis = kurtosis(y);
-  const flux_range = Math.max(...y) - Math.min(...y);
-  const flux_iqr = iqr(y);
-  const flux_rms = Math.sqrt(mean(yCentered.map((v) => v * v)));
-
-  // Data quality
-  const n_points = rows.length;
-  const time_span = Math.max(...t) - Math.min(...t);
-  const cadences = t.slice(1).map((ti, i) => ti - t[i]);
-  const cadence_median = cadences.length ? median(cadences) : 0;
-  const cadence_std = cadences.length ? std(cadences) : 0;
-
-  // Transit-ish
-  const depth = yMed - median(y.filter((v) => v < yMed)); // crude
-  const transit_depth = depth;
-  const transit_significance = flux_mad > 0 ? depth / flux_mad : 0;
-
-  // Period proxy
-  const { best_period, power: bls_power, width } = estimatePeriodViaACF(rows);
-  const period_error = width || cadence_median * 2;
-
-  return {
-    flux_mean,
-    flux_std,
-    flux_median,
-    flux_mad,
-    flux_skew,
-    flux_kurtosis,
-    flux_range,
-    flux_iqr,
-    flux_rms,
-    best_period,
-    bls_power,
-    period_error,
-    n_points,
-    time_span,
-    cadence_median,
-    cadence_std,
-    transit_depth,
-    transit_significance,
-  };
-}
-
-/* ============================
-   Heuristic fallback "model"
-============================= */
-function fallbackPredict(f: Features): Output {
-  const z1 = clamp(f.transit_significance / 10, 0, 2); // ~0..2
-  const z2 = clamp(f.bls_power, 0, 1); // 0..1
-  const z = 0.9 * z1 + 0.8 * z2 - 0.6;
-  const proba = 1 / (1 + Math.exp(-3 * z)); // sigmoid
-  return { predicted_label: proba >= 0.7 ? 1 : 0, predicted_proba: proba };
-}
-
-/* ============================
-   Radial confidence
-============================= */
+// ============================
+// Radial confidence meter component
+// ============================
 function Radial({ p }: { p: number }) {
   const pct = clamp(p, 0, 1);
-  const R = 38,
-    C = 2 * Math.PI * R,
-    off = C * (1 - pct);
-  const band = pct < 0.3 ? "red" : pct < 0.7 ? "yellow" : "emerald";
+  const R = 38, C = 2 * Math.PI * R, off = C * (1 - pct);
+  const band = pct < 0.6 ? "red" : pct < 0.8 ? "yellow" : "emerald";
+  
   return (
     <div className="relative w-24 h-24">
       <svg viewBox="0 0 100 100" className="w-24 h-24">
+        <circle cx="50" cy="50" r={R} className="fill-none stroke-[10] stroke-white/10" />
         <circle
           cx="50"
           cy="50"
           r={R}
-          className="fill-none stroke-[10] stroke-white/10"
-        />
-        <circle
-          cx="50"
-          cy="50"
-          r={R}
-          className={`fill-none stroke-[10] -rotate-90 origin-center stroke-${band}-400`}
+          className={`fill-none stroke-[10] -rotate-90 origin-center stroke-${band}-400 transition-all duration-1000`}
           strokeDasharray={C}
           strokeDashoffset={off}
         />
@@ -259,68 +84,235 @@ function Radial({ p }: { p: number }) {
   );
 }
 
-/* ============================
-   Main page
-============================= */
+// ============================
+// Input Field Component
+// ============================
+function InputField({ label, unit, value, onChange }: { 
+    label: string; 
+    unit: string; 
+    value: number | ""; 
+    onChange: (v: number | "") => void; 
+}) {
+  return (
+    <div className="flex flex-col">
+      <label className="text-white/60 text-xs uppercase tracking-wide mb-1">
+        {label}
+      </label>
+      <div className="relative">
+        <input
+          type="number"
+          step="any"
+          value={value}
+          onChange={(e) => {
+            const val = e.target.value;
+            onChange(val === "" ? "" : parseFloat(val));
+          }}
+          className="w-full bg-white/[0.05] border border-white/10 rounded-lg p-2 text-white placeholder-white/30 focus:ring-emerald-400 focus:border-emerald-400"
+          placeholder="Enter value"
+        />
+        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-white/40 text-xs">
+          {unit}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Card({ title, className, children }: { title: string; className?: string; children: React.ReactNode; }) {
+  return (
+    <div
+      className={`rounded-3xl border border-white/10 bg-white/[0.02] backdrop-blur p-5 md:p-7 ${
+        className || ""
+      }`}
+    >
+      <div className="mb-3 text-sm font-medium text-white/70">{title}</div>
+      {children}
+    </div>
+  );
+}
+
+
+// ============================
+// Main Dashboard
+// ============================
 export default function DashboardPage() {
-  const [rows, setRows] = useState<Row[]>([]);
-  const [detrendOn, setDetrendOn] = useState(true);
-  const [sigma, setSigma] = useState(4);
-  const [features, setFeatures] = useState<Features | null>(null);
-  const [output, setOutput] = useState<Output | null>(null);
+  const [clientId, setClientId] = useState<string>('');
+  const [inputData, setInputData] = useState<FeatureInput>(INITIAL_INPUT);
+  const [output, setOutput] = useState<PredictionOutput | null>(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const det = useMemo(
-    () => (detrendOn ? rollingMedianDetrend(rows) : []),
-    [rows, detrendOn]
-  );
+  const fileInputRef = useRef<HTMLInputElement>(null); // Reference to the hidden file input
 
-  const onFile = async (file: File) => {
+  // New states for CSV upload
+  const [csvFile, setCsvFile] = useState<File | null>(null);
+  const [csvTaskId, setCsvTaskId] = useState<string | null>(null);
+  const [csvLoading, setCsvLoading] = useState(false);
+  // Multimodal image upload state
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [fusionProb, setFusionProb] = useState<number | null>(null);
+  const [fusionLoading, setFusionLoading] = useState(false);
+
+  // Set unique client ID on mount for WebSocket communication
+  useEffect(() => {
+    setClientId(uuidv4());
+  }, []);
+
+  // --- HANDLER FOR SINGLE PREDICTION ---
+  const analyzeSingle = async () => {
+    // ... (analyzeSingle logic remains the same)
     setError(null);
-    try {
-      const text = await file.text();
-      const parsed = parseCSV(text);
-      if (!parsed.length) throw new Error("No valid rows parsed.");
-      // (optional) sigma-clip
-      const med = median(parsed.map((r) => r.flux));
-      const m = mad(parsed.map((r) => r.flux)) || 1e-9;
-      const lo = med - sigma * m * 1.4826,
-        hi = med + sigma * m * 1.4826;
-      const clipped = parsed.filter((r) => r.flux >= lo && r.flux <= hi);
-      setRows(clipped);
-      setFeatures(null);
-      setOutput(null);
-    } catch (e: any) {
-      setError(e?.message || "Failed to parse CSV.");
-    }
-  };
+    setLoading(true);
+    setOutput(null);
 
-  // post route after fastapi(todo)
-  const analyze = async () => {
-    if (!rows.length) return;
-    const f = computeFeatures(rows);
-    setFeatures(f);
+    const payload = Object.fromEntries(
+        Object.entries(inputData)
+            .map(([key, value]) => [key, (Number.isFinite(value) ? value : null)])
+    );
+
     try {
-      const res = await fetch("/api/predict", {
+      // Send single synchronous prediction request
+      const res = await fetch("http://localhost:8000/predict", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ features: f }),
+        body: JSON.stringify(payload),
       });
-      if (!res.ok) throw new Error("stub");
-      const data = (await res.json()) as Output;
-      setOutput(data);
-    } catch {
-      setOutput(fallbackPredict(f));
+
+      if (!res.ok) {
+        // Try to parse JSON error body, otherwise use text
+        let errText = `Server error: ${res.status}`;
+        try {
+          const errData = await res.json();
+          errText = errData.detail ? JSON.stringify(errData.detail) : JSON.stringify(errData);
+        } catch (e) {
+          try {
+            errText = await res.text();
+          } catch (ee) {
+            /* ignore */
+          }
+        }
+        throw new Error(errText);
+      }
+
+      const data = await res.json();
+      // backend returns { result: { probability: ... } }
+      const prob = data?.result?.probability ?? data?.probability ?? null;
+      if (prob !== null) {
+        setFusionProb(prob);
+        setOutput(null);
+      } else {
+        setError('Prediction returned no probability');
+      }
+
+    } catch (e: any) {
+      // Ensure we stringify objects so they render nicely in the UI
+      const msg = typeof e === 'string' ? e : (e?.message ?? JSON.stringify(e));
+      setError(msg || "Failed to connect to ML API.");
+    } finally {
+      setLoading(false);
     }
   };
 
-  const verdict = output
-    ? output.predicted_proba < 0.3
-      ? "Very likely non-planet"
-      : output.predicted_proba < 0.7
-      ? "Uncertain (needs follow-up)"
-      : "Very likely planet"
-    : "—";
+  // --- HANDLER FOR MULTIMODAL (TABULAR + IMAGE) ---
+  const analyzeMultimodal = async () => {
+    setFusionLoading(true);
+    setFusionProb(null);
+    setError(null);
+
+    const tabularArray = Object.values(inputData).map(v => Number.isFinite(v) ? v : 0.0);
+
+    const form = new FormData();
+    form.append('tabular', JSON.stringify(tabularArray));
+    if (imageFile) form.append('image', imageFile);
+
+    try {
+      const res = await fetch('http://localhost:8000/predict/multimodal', {
+        method: 'POST',
+        body: form,
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || `Server error ${res.status}`);
+      }
+
+      const data = await res.json();
+      setFusionProb(data.probability ?? null);
+    } catch (e: any) {
+      setError(e?.message || 'Fusion prediction failed');
+    } finally {
+      setFusionLoading(false);
+    }
+  };
+  
+  // --- HANDLER FOR BATCH UPLOAD/SUBMISSION ---
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0] || null;
+    setCsvFile(f);
+    setCsvTaskId(null);
+    setError(null);
+  };
+  
+  const uploadBatch = async () => {
+    if (!csvFile || !clientId) {
+      setError("Please select a file and ensure client ID is set.");
+      return;
+    }
+    setCsvLoading(true);
+    setError(null);
+    setCsvTaskId(null);
+
+    const formData = new FormData();
+    formData.append("file", csvFile); 
+    formData.append("client_id", clientId); 
+
+    try {
+      // Use the synchronous CSV endpoint for now to avoid server-side batch-size rejections
+      const res = await fetch("http://localhost:8000/predict/csv_tabular", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!res.ok) {
+        let errText = `Server rejected file: ${res.status}`;
+        try {
+          const errData = await res.json();
+          errText = errData.detail ? JSON.stringify(errData.detail) : JSON.stringify(errData);
+        } catch (e) {
+          try { errText = await res.text(); } catch (_) {}
+        }
+        throw new Error(errText);
+      }
+
+      const data = await res.json();
+      // data.predictions is an array of { probability } or { error }
+      // Store a short summary (number of rows and any errors)
+      const preds = data.predictions || [];
+      const errors = preds.filter((p: any) => p.error).length;
+      setCsvTaskId(`sync:${preds.length}:${errors}`);
+      // Optionally, you could store full results in state for a results view
+      
+    } catch (e: any) {
+      const msg = typeof e === 'string' ? e : (e?.message ?? JSON.stringify(e));
+      setError(msg || "Failed to submit batch CSV.");
+    } finally {
+      setCsvLoading(false);
+    }
+  };
+
+
+  // --- Output Display Logic (remains the same) ---
+  const currentConfidence = useMemo(() => output 
+    ? output.Predicted_Disposition === 'CONFIRMED' ? output.Confidence_Confirmed : output.Confidence_False_Positive
+    : 0, [output]);
+  
+  const verdict = output ? (
+    output.Predicted_Disposition === 'CONFIRMED' ? "Yes, likely an Exoplanet" : "No, likely a Non-planet (False Positive)"
+  ) : "—";
+  
+  const bandColor = output ? (
+    currentConfidence < 0.7 ? "text-yellow-400" : "text-emerald-400"
+  ) : "text-white/70";
 
   return (
     <main className="relative min-h-screen bg-black text-white overflow-hidden">
@@ -337,290 +329,142 @@ export default function DashboardPage() {
           className="mb-8 flex items-center justify-between gap-4"
         >
           <h1 className="text-2xl md:text-4xl font-semibold tracking-tight">
-            lol
+            Exoplanet Vetting Tool
           </h1>
           <Link href="/" className="text-white/60 hover:text-white text-sm">
             ← back
           </Link>
         </motion.div>
 
-        {/* Step 1: Upload */}
-        <motion.div
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.05, duration: 0.6 }}
-          className="grid md:grid-cols-3 gap-6"
-        >
-          <div className="md:col-span-2 rounded-3xl border border-white/10 bg-white/[0.02] backdrop-blur p-6">
-            <div className="mb-3 text-sm font-medium text-white/70">
-              1) Upload light curve (CSV)
+        <div className="grid md:grid-cols-5 gap-6">
+          
+          {/* 1) Input Form (Col 1-3) */}
+          <Card title="1) Manual Vetting (Single Candidate)" className="md:col-span-3">
+            <div className="grid grid-cols-2 gap-4">
+              <InputField label="Orbital Period" unit="days" value={inputData.orbital_period_days} onChange={(v) => setInputData(p => ({ ...p, orbital_period_days: v }))} />
+              <InputField label="Transit Duration" unit="hours" value={inputData.transit_duration_hours} onChange={(v) => setInputData(p => ({ ...p, transit_duration_hours: v }))} />
+              <InputField label="Transit Depth" unit="ppm" value={inputData.transit_depth_ppm} onChange={(v) => setInputData(p => ({ ...p, transit_depth_ppm: v }))} />
+              <InputField label="Planetary Radius" unit="R_Earth" value={inputData.planet_radius_re} onChange={(v) => setInputData(p => ({ ...p, planet_radius_re: v }))} />
+              <InputField label="Equilibrium Temp" unit="K" value={inputData.equilibrium_temp_k} onChange={(v) => setInputData(p => ({ ...p, equilibrium_temp_k: v }))} />
+              <InputField label="Insolation Flux" unit="Earth Flux" value={inputData.insolation_flux_earth} onChange={(v) => setInputData(p => ({ ...p, insolation_flux_earth: v }))} />
+              <InputField label="Stellar Temp" unit="K" value={inputData.stellar_teff_k} onChange={(v) => setInputData(p => ({ ...p, stellar_teff_k: v }))} />
+              <InputField label="Stellar Radius" unit="R_Sun" value={inputData.stellar_radius_re} onChange={(v) => setInputData(p => ({ ...p, stellar_radius_re: v }))} />
+              <InputField label="Apparent Mag" unit="mag" value={inputData.apparent_mag} onChange={(v) => setInputData(p => ({ ...p, apparent_mag: v }))} />
+              <InputField label="RA" unit="deg" value={inputData.ra} onChange={(v) => setInputData(p => ({ ...p, ra: v }))} />
+              <InputField label="Dec" unit="deg" value={inputData.dec} onChange={(v) => setInputData(p => ({ ...p, dec: v }))} />
             </div>
-
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                const f = e.dataTransfer.files?.[0];
-                if (f) onFile(f);
-              }}
-              className="border border-dashed border-white/20 rounded-2xl p-8 text-center hover:border-white/40 transition"
-            >
-              <p className="text-white/70">
-                Drag & drop a CSV with{" "}
-                <code className="text-white">time, flux[, flux_err]</code>
-              </p>
-              <div className="mt-4">
-                <label className="inline-block px-4 py-2 rounded-xl bg-white text-black font-medium cursor-pointer hover:opacity-90">
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) onFile(f);
-                    }}
-                  />
-                  Choose file
-                </label>
-              </div>
-              {error && <p className="mt-3 text-red-300 text-sm">{error}</p>}
+            <div className="mt-6">
+                <button
+                    onClick={analyzeSingle}
+                    disabled={loading}
+                    className="w-full px-6 py-3 rounded-xl bg-emerald-600 text-white font-semibold text-lg hover:bg-emerald-500 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    {loading ? "Analyzing..." : "Analyze Single Candidate"}
+                </button>
             </div>
-
-            {rows.length > 0 && (
-              <div className="mt-5 text-xs text-white/70">
-                Loaded <b>{rows.length}</b> points • First 5 rows:
-                <div className="mt-2 overflow-x-auto rounded-xl border border-white/10">
-                  <table className="w-full text-left whitespace-nowrap">
-                    <thead className="bg-white/5">
-                      <tr>
-                        <th className="px-3 py-2">time</th>
-                        <th className="px-3 py-2">flux</th>
-                        <th className="px-3 py-2">flux_err</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {rows.slice(0, 5).map((r, i) => (
-                        <tr key={i} className="border-t border-white/5">
-                          <td className="px-3 py-2">{r.time}</td>
-                          <td className="px-3 py-2">{r.flux}</td>
-                          <td className="px-3 py-2">{r.flux_err ?? ""}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-        </motion.div>
-
-        {/* KPIs */}
-        {rows.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, amount: 0.4 }}
-            transition={{ duration: 0.6 }}
-            className="mt-8 grid grid-cols-2 md:grid-cols-4 gap-4"
-          >
-            <KPI label="Points" value={rows.length.toLocaleString()} />
-            <KPI
-              label="Span (d)"
-              value={fmtNum(
-                Math.max(...rows.map((r) => r.time)) -
-                  Math.min(...rows.map((r) => r.time))
-              )}
-            />
-            <KPI
-              label="Median cadence (d)"
-              value={fmtNum(
-                median(rows.slice(1).map((r, i) => r.time - rows[i].time)) || 0
-              )}
-            />
-            <KPI
-              label="RMS"
-              value={fmtNum(
-                Math.sqrt(
-                  mean(
-                    rows
-                      .map((r) => r.flux)
-                      .map((v) => (v - median(rows.map((r) => r.flux))) ** 2)
-                  )
-                )
-              )}
-            />
-          </motion.div>
-        )}
-
-        {/* Charts */}
-        {rows.length > 0 && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, amount: 0.3 }}
-            transition={{ duration: 0.6 }}
-            className="mt-8 grid lg:grid-cols-2 gap-6"
-          >
-            <Card title="Raw light curve">
-              <ChartLC
-                data={rows.map((r) => ({ time: r.time, flux: r.flux }))}
-              />
-            </Card>
-            <Card
-              title={detrendOn ? "Detrended (flux/trend)" : "Detrended (off)"}
-            >
-              <ChartDetrended
-                data={(det.length ? det : rows).map((r: any) => ({
-                  time: r.time,
-                  flux: r.flux_detrended ?? r.flux,
-                }))}
-              />
-            </Card>
-          </motion.div>
-        )}
-
-        {/* Output & Features */}
-        {(features || output) && (
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, amount: 0.3 }}
-            transition={{ duration: 0.6 }}
-            className="mt-8 grid md:grid-cols-5 gap-6"
-          >
-            <Card className="md:col-span-2" title="Model output">
-              {output ? (
+          </Card>
+          
+          {/* 2) Output Display (Col 4-5) */}
+          <Card title="2) Model Output" className="md:col-span-2 flex flex-col justify-between">
+            <div>
+              <div className="pt-6">
                 <div className="flex items-center gap-5">
-                  <Radial p={output.predicted_proba} />
+                  <Radial p={currentConfidence} />
                   <div>
                     <div className="text-sm uppercase tracking-wide text-white/60">
-                      classification
+                      Verdict
                     </div>
-                    <div className="mt-1 text-2xl font-semibold">
-                      {output.predicted_label === 1 ? "Planet" : "Non-planet"}
+                    <div className={`mt-1 text-2xl font-semibold ${bandColor}`}>
+                      {verdict}
                     </div>
-                    <div className="mt-1 text-sm text-white/70">{verdict}</div>
+                    {output && (
+                      <div className="mt-1 text-sm text-white/70">
+                        {output.Predicted_Disposition === 'CONFIRMED' 
+                          ? `FP Probability: ${fmtNum(output.Confidence_False_Positive)}`
+                          : `Confirmed Probability: ${fmtNum(output.Confidence_Confirmed)}`
+                        }
+                      </div>
+                    )}
                   </div>
                 </div>
-              ) : (
-                <div className="text-white/60 text-sm">
-                  Run “Analyze” to see predictions.
-                </div>
-              )}
-            </Card>
+              </div>
+            </div>
+            <div className="mt-6">
+              <div className="text-sm text-white/70 mb-2">Optional multimodal image:</div>
+              <input type="file" accept="image/*" onChange={(e) => setImageFile(e.target.files?.[0] ?? null)} />
+              <div className="mt-3 flex gap-3">
+                <button onClick={analyzeMultimodal} disabled={fusionLoading} className="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-500">
+                  {fusionLoading ? 'Running...' : 'Analyze with Image (Fusion)'}
+                </button>
+                {fusionProb !== null && (
+                  <div className="text-sm text-white/80">Fusion Probability: <b>{Math.round(fusionProb * 100)}%</b></div>
+                )}
+              </div>
+            </div>
+          </Card>
+        </div>
+        
+        {/* 3) CSV Batch Upload Section (The Fix) */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, amount: 0.3 }}
+          transition={{ duration: 0.6, delay: 0.2 }}
+          className="mt-6"
+        >
+          <Card title="3) Batch Vetting (CSV Upload)" className="md:col-span-5">
+            <p className="mb-4 text-sm text-white/70">
+              Upload a CSV file containing multiple candidates for batch processing.
+            </p>
+            <div className="flex items-center space-x-4">
+              
+              {/* Hidden File Input */}
+              <input
+                type="file"
+                accept=".csv"
+                ref={fileInputRef}
+                style={{ display: 'none' }}
+                onChange={handleFileChange}
+              />
 
-            <Card className="md:col-span-3" title="Features (18)">
-              {features ? (
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
-                  {Object.entries(features).map(([k, v]) => (
-                    <div
-                      key={k}
-                      className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2"
-                    >
-                      <div className="text-white/50 text-[11px] uppercase tracking-wide">
-                        {k}
-                      </div>
-                      <div className="mt-1 font-semibold">{fmtNum(v)}</div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-white/60 text-sm">
-                  Features will appear after analysis.
-                </div>
-              )}
-            </Card>
-          </motion.div>
-        )}
+              {/* Custom 'Choose file' Button */}
+              <button
+                onClick={() => fileInputRef.current?.click()} // Click the hidden input
+                disabled={csvLoading}
+                className="px-6 py-2 rounded-xl bg-white/10 text-white font-semibold hover:bg-white/20 transition disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Choose File
+              </button>
+
+              <div className="text-white/70 text-sm flex-grow">
+                {csvFile ? <b>{csvFile.name}</b> : "No file selected"}
+              </div>
+
+              {/* Submit Button */}
+              <button
+                onClick={uploadBatch}
+                disabled={csvLoading || !csvFile}
+                className="px-6 py-2 rounded-xl bg-blue-600 text-white font-semibold hover:bg-blue-500 transition disabled:opacity-50"
+              >
+                {csvLoading ? "Uploading..." : "Start Batch Analysis"}
+              </button>
+            </div>
+
+            {csvTaskId && (
+              <div className="mt-4 p-3 bg-blue-900/30 rounded-lg text-sm">
+                Batch Submitted! Task ID: <b>{csvTaskId}</b>
+                <p className="text-xs mt-1 text-white/50">
+                  Monitor task status using the backend API endpoint.
+                </p>
+              </div>
+            )}
+          </Card>
+        </motion.div>
+        
+        {/* Error/Log display */}
+        {error && <div className="mt-6 p-4 bg-red-900/30 text-red-300 rounded-xl text-sm">Error: {error}</div>}
+
       </section>
     </main>
   );
-}
-
-/* ========== Small subcomponents ========== */
-function KPI({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-5 py-4">
-      <div className="text-xs text-white/60 uppercase tracking-wide">
-        {label}
-      </div>
-      <div className="mt-1 text-3xl font-semibold">{value}</div>
-    </div>
-  );
-}
-
-function Card({
-  title,
-  className,
-  children,
-}: {
-  title: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      className={`rounded-3xl border border-white/10 bg-white/[0.02] backdrop-blur p-5 md:p-7 ${
-        className || ""
-      }`}
-    >
-      <div className="mb-3 text-sm font-medium text-white/70">{title}</div>
-      {children}
-    </div>
-  );
-}
-
-function ChartLC({ data }: { data: { time: number; flux: number }[] }) {
-  return (
-    <div className="h-64 md:h-72">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={data}>
-          <CartesianGrid stroke="rgba(255,255,255,0.06)" />
-          <XAxis dataKey="time" stroke="#aaa" />
-          <YAxis stroke="#aaa" />
-          <Tooltip
-            contentStyle={{
-              background: "rgba(0,0,0,0.8)",
-              border: "1px solid rgba(255,255,255,0.1)",
-            }}
-          />
-          <Line
-            type="monotone"
-            dataKey="flux"
-            dot={false}
-            stroke="#fff"
-            strokeWidth={1.2}
-          />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-function ChartDetrended({ data }: { data: { time: number; flux: number }[] }) {
-  return (
-    <div className="h-64 md:h-72">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data}>
-          <CartesianGrid stroke="rgba(255,255,255,0.06)" />
-          <XAxis dataKey="time" stroke="#aaa" />
-          <YAxis stroke="#aaa" />
-          <Tooltip
-            contentStyle={{
-              background: "rgba(0,0,0,0.8)",
-              border: "1px solid rgba(255,255,255,0.1)",
-            }}
-          />
-          <Area dataKey="flux" stroke="#fff" fill="rgba(255,255,255,0.12)" />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-function fmtNum(n: number) {
-  if (!Number.isFinite(n)) return "—";
-  if (Math.abs(n) >= 1000) return n.toFixed(0);
-  return Number.isInteger(n) ? n.toString() : n.toFixed(4);
 }
