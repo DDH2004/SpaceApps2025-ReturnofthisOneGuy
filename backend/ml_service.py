@@ -97,13 +97,48 @@ class ExoplanetPredictor:
             mission_encoded = 1 if data['mission'].upper() == 'TESS' else 0
             data['mission_encoded'] = mission_encoded
             
+            # Map input field names to model feature names
+            feature_mapping = {
+                'ORB_PERIOD': 'orbital_period_days',
+                'transit_duration_hours': 'transit_duration_hours',
+                'TRANSIT_DEPTH': 'transit_depth_ppm',
+                'PLANET_RADIUS': 'planet_radius_re',
+                'equilibrium_temp_k': 'equilibrium_temp_k',
+                'INSOL_FLUX': 'insolation_flux_earth',
+                'stellar_teff_k': 'stellar_teff_k',
+                'STELLAR_RADIUS': 'stellar_radius_re',
+                'apparent_mag': 'apparent_mag',
+                'ra': 'ra',
+                'dec': 'dec',
+                'R_PLANET_R_STAR_RATIO': None,  # Calculated field
+                'DEPTH_PER_RADIUS': None,  # Calculated field
+                'mission_encoded': None  # Special handling
+            }
+            
             # Create feature vector in the correct order
             feature_vector = []
             for column in self.feature_columns:
                 if column == 'mission_encoded':
                     feature_vector.append(mission_encoded)
+                elif column == 'R_PLANET_R_STAR_RATIO':
+                    # Calculate planet radius to stellar radius ratio
+                    planet_radius = data.get('planet_radius_re', FEATURE_DEFAULTS.get('planet_radius_re', 1.0))
+                    stellar_radius = data.get('stellar_radius_re', FEATURE_DEFAULTS.get('stellar_radius_re', 1.0))
+                    ratio = planet_radius / stellar_radius if stellar_radius != 0 else 0
+                    feature_vector.append(ratio)
+                elif column == 'DEPTH_PER_RADIUS':
+                    # Calculate transit depth per planet radius
+                    depth = data.get('transit_depth_ppm', FEATURE_DEFAULTS.get('transit_depth_ppm', 1000.0))
+                    planet_radius = data.get('planet_radius_re', FEATURE_DEFAULTS.get('planet_radius_re', 1.0))
+                    depth_per_radius = depth / planet_radius if planet_radius != 0 else 0
+                    feature_vector.append(depth_per_radius)
                 else:
-                    feature_vector.append(data.get(column, FEATURE_DEFAULTS.get(column, 0.0)))
+                    # Map to the correct input field name
+                    input_field = feature_mapping.get(column, column)
+                    if input_field:
+                        feature_vector.append(data.get(input_field, FEATURE_DEFAULTS.get(input_field, 0.0)))
+                    else:
+                        feature_vector.append(0.0)
             
             # Convert to numpy array and reshape
             features = np.array(feature_vector).reshape(1, -1)
@@ -133,27 +168,93 @@ class ExoplanetPredictor:
             # Make prediction
             prediction = self.model.predict(features)[0]
             probability = self.model.predict_proba(features)[0]
-            logger.debug(f"Raw model.predict_proba output: {probability}")
+            logger.info(f"Raw model.predict_proba output: {probability}")
+            logger.info(f"Model classes: {getattr(self.model, 'classes_', 'Unknown')}")
+            logger.info(f"Feature vector shape: {features.shape}")
             
             # Get probability for the positive class (exoplanet)
             exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
-            logger.info(f"Prediction: {prediction}, Probability: {exoplanet_probability}")
+            non_exoplanet_probability = probability[0] if len(probability) > 1 else (1 - probability[0])
             
-            # Determine confidence level
-            confidence_level = self._get_confidence_level(exoplanet_probability)
+            logger.info(f"Prediction: {prediction}")
+            logger.info(f"Probability of NOT being a planet (class 0): {non_exoplanet_probability}")
+            logger.info(f"Probability of being a planet (class 1): {exoplanet_probability}")
+            logger.info(f"Sum of probabilities: {non_exoplanet_probability + exoplanet_probability}")
+            
+
+            
+            # Determine confidence level and message
+            confidence_level = self._get_confidence_level(exoplanet_probability, prediction)
+            confidence_message = self._get_confidence_message(exoplanet_probability, prediction)
+            
+            # Calculate feature importance and z-scores for analysis
+            feature_analysis = self._calculate_feature_analysis(features[0], request)
+            feature_analysis["confidence_message"] = confidence_message
+            
+            # Add diagnostic information
+            feature_analysis["model_diagnostic"] = {
+                "raw_probabilities": probability.tolist(),
+                "class_0_probability": float(probability[0]) if len(probability) > 1 else float(1 - probability[0]),
+                "class_1_probability": float(probability[1]) if len(probability) > 1 else float(probability[0]),
+                "model_classes": getattr(self.model, 'classes_', []).tolist()
+            }
             
             processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
             
-            return PredictionResult(
+            result = PredictionResult(
                 prediction=int(prediction),
                 probability=float(exoplanet_probability),
                 confidence_level=confidence_level,
                 processing_time_ms=processing_time
             )
             
+            # Add feature analysis to result
+            result.feature_analysis = feature_analysis
+            
+            return result
+            
         except Exception as e:
             logger.error(f"Error making prediction: {e}")
             raise
+    
+    def _calculate_feature_analysis(self, features: np.ndarray, request: ExoplanetPredictionRequest) -> Dict[str, Any]:
+        """Calculate feature importance and z-scores for visualization"""
+        try:
+            # Get feature importances from the model
+            if hasattr(self.model, 'feature_importances_'):
+                importances = self.model.feature_importances_
+                
+                # Create feature importance mapping
+                feature_importance = dict(zip(self.feature_columns, importances))
+                
+                # Calculate z-scores (standardized feature values)
+                # If we have a scaler, the features are already standardized
+                z_scores = {}
+                for i, column in enumerate(self.feature_columns):
+                    if i < len(features):
+                        z_scores[column] = float(features[i])
+                
+                # Get top features by importance
+                top_features = []
+                for column, importance in sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:10]:
+                    z_score = z_scores.get(column, 0.0)
+                    top_features.append({
+                        "name": column,
+                        "importance": float(importance),
+                        "z": float(z_score)
+                    })
+                
+                return {
+                    "feature_importance": feature_importance,
+                    "z_scores": z_scores,
+                    "top_features": top_features
+                }
+            else:
+                return {"error": "Model does not have feature importances"}
+                
+        except Exception as e:
+            logger.error(f"Error calculating feature analysis: {e}")
+            return {"error": str(e)}
     
     def predict_batch(self, requests: List[ExoplanetPredictionRequest]) -> List[PredictionResult]:
         """Make batch predictions"""
@@ -189,7 +290,7 @@ class ExoplanetPredictor:
                 logger.debug(f"Row {i} probability array: {probability}")
                 exoplanet_probability = probability[1] if len(probability) > 1 else probability[0]
                 logger.info(f"Batch Prediction [{i}]: {prediction}, Probability: {exoplanet_probability}")
-                confidence_level = self._get_confidence_level(exoplanet_probability)
+                confidence_level = self._get_confidence_level(exoplanet_probability, prediction)
 
                 results.append(PredictionResult(
                     prediction=int(prediction),
@@ -204,14 +305,48 @@ class ExoplanetPredictor:
             logger.error(f"Error making batch predictions: {e}")
             raise
     
-    def _get_confidence_level(self, probability: float) -> str:
-        """Determine confidence level based on probability"""
-        if probability >= 0.8 or probability <= 0.2:
-            return "High"
-        elif probability >= 0.6 or probability <= 0.4:
-            return "Medium"
-        else:
-            return "Low"
+    def _get_confidence_level(self, probability: float, prediction: int) -> str:
+        """Determine confidence level based on probability and prediction"""
+        # For exoplanet prediction (1): high confidence when probability is high
+        # For non-exoplanet prediction (0): high confidence when probability is low
+        if prediction == 1:  # Predicted as exoplanet
+            if probability >= 0.8:
+                return "High"
+            elif probability >= 0.6:
+                return "Medium"
+            else:
+                return "Low"
+        else:  # Predicted as non-exoplanet
+            if probability <= 0.2:
+                return "High"
+            elif probability <= 0.4:
+                return "Medium"
+            else:
+                return "Low"
+    
+    def _get_confidence_message(self, probability: float, prediction: int) -> str:
+        """Generate a human-readable confidence message"""
+        if prediction == 1:  # Predicted as exoplanet
+            # Add more nuanced messaging based on probability ranges
+            if probability >= 0.95:
+                return "Very likely planet"
+            elif probability >= 0.8:
+                return "Likely planet"
+            elif probability >= 0.6:
+                return "Possibly planet"
+            else:
+                return "Uncertain - leaning planet"
+        else:  # Predicted as non-exoplanet (prediction == 0)
+            # For non-exoplanet predictions, we want to show confidence in NOT being a planet
+            # High confidence means low probability (close to 0)
+            if probability <= 0.05:
+                return "Very likely not a planet"
+            elif probability <= 0.2:
+                return "Likely not a planet"
+            elif probability <= 0.4:
+                return "Possibly not a planet"
+            else:
+                return "Uncertain - leaning not a planet"
     
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about the loaded model"""

@@ -405,7 +405,11 @@ function TabularPanel() {
           <AnalysisSkeleton />
         ) : output ? (
           <div className="space-y-6">
-            <ProbabilityOrb p={output.predicted_proba} />
+            <ProbabilityOrb 
+              p={output.predicted_proba} 
+              prediction={output.predicted_label}
+              confidenceMessage={extras?.confidence_message}
+            />
             <RadarFeatures
               items={(extras?.top_features ?? []).filter((d: any) =>
                 Number.isFinite(d?.z)
@@ -645,7 +649,11 @@ function MultimodalPanel() {
           <AnalysisSkeleton />
         ) : output ? (
           <div className="space-y-6">
-            <ProbabilityOrb p={output.predicted_proba} />
+            <ProbabilityOrb 
+              p={output.predicted_proba} 
+              prediction={output.predicted_label}
+              confidenceMessage={extras?.confidence_message}
+            />
             <div className="text-xs text-white/60 uppercase tracking-wide">
               CNN data used:{" "}
               <span

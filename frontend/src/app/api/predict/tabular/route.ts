@@ -71,14 +71,23 @@ export async function POST(req: Request) {
     console.log("Backend response:", data);
     
     // Transform backend response to match frontend expectations
+    const featureAnalysis = data.feature_analysis || {};
+    const topFeatures = featureAnalysis.top_features || [];
+    const zScores = featureAnalysis.z_scores || {};
+    const confidenceMessage = featureAnalysis.confidence_message || "Unknown confidence";
+    const modelDiagnostic = featureAnalysis.model_diagnostic || {};
+    
     return NextResponse.json({
       predicted_label: data.prediction,
       predicted_proba: data.probability,
-      debug_features: {}, // Add if available from backend
+      debug_features: zScores,
       extras: {
         confidence_level: data.confidence_level,
+        confidence_message: confidenceMessage,
         processing_time_ms: data.processing_time_ms,
-        top_features: [] // Add if available from backend
+        top_features: topFeatures,
+        feature_importance: featureAnalysis.feature_importance || {},
+        model_diagnostic: modelDiagnostic
       }
     });
   } catch (e: any) {

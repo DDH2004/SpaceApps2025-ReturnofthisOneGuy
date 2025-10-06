@@ -35,6 +35,7 @@ class PredictionResult(BaseModel):
     probability: float = Field(..., ge=0, le=1, description="Confidence probability")
     confidence_level: str = Field(..., description="High/Medium/Low confidence")
     processing_time_ms: float = Field(..., description="Processing time in milliseconds")
+    feature_analysis: Optional[Dict[str, Any]] = Field(None, description="Feature importance and analysis data")
 
 class TaskTelemetry(BaseModel):
     """Telemetry data for task monitoring"""
