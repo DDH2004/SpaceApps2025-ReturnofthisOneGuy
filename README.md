@@ -61,6 +61,9 @@ This project implements a **comprehensive exoplanet detection system** combining
 - **Pipeline**: Automated preprocessing, scaling, missing value imputation
 - **Format**: Support for both individual and batch predictions
 
+  <img width="913" height="749" alt="wewe" src="https://github.com/user-attachments/assets/2c198013-c6dc-4ce4-b424-34260316d1aa" />
+
+
 ### Web Platform
 
 - **Frontend**: Modern React interface with real-time updates
