@@ -103,14 +103,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware
+# Allow frontend requests (adjust if deployed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["*"],  # or ["http://localhost:3000"] for safety
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Model loading is handled in the lifespan context manager above
 
 async def telemetry_monitor():
     """Background task to monitor and broadcast telemetry"""
@@ -224,23 +226,20 @@ async def health_check():
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
-@app.post("/predict", response_model=SingleTaskResponse)
-async def predict_single(request: ExoplanetPredictionRequest):
-    """Submit a single prediction task"""
+@app.post("/predict", response_model=PredictionResult)
+async def predict(request: ExoplanetPredictionRequest):
     try:
-        # Submit task to Celery
-        task = predict_single_exoplanet.delay(request.dict())
+        predictor = get_predictor()
+        if not predictor.is_loaded:
+            logger.error("Predictor not loaded, attempting to load...")
+            if not predictor.load_model():
+                raise HTTPException(status_code=503, detail="ML model not available")
         
-        return SingleTaskResponse(
-            task_id=task.id,
-            status=TaskStatus.PENDING,
-            estimated_completion_time=utc_now() + timedelta(seconds=30),
-            message=f"Prediction task submitted successfully. Task ID: {task.id}"
-        )
-        
+        result = predictor.predict_single(request)
+        return result
     except Exception as e:
-        logger.error(f"Error submitting prediction task: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 @app.post("/predict/batch", response_model=BatchTaskResponse)
 async def predict_batch(request: BatchPredictionRequest):
@@ -361,31 +360,39 @@ async def predict_from_csv(file: UploadFile = File(...)):
         if not predictor.is_loaded:
             predictor.load_model()
 
-        # Map DataFrame rows to ExoplanetPredictionRequest
-        requests = []
+        # Map CSV columns to expected feature names
+        expected_features = [
+            "id", "mission", "disposition", "label", "orbital_period_days", "transit_duration_hours",
+            "transit_depth_ppm", "planet_radius_re", "equilibrium_temp_k", "insolation_flux_earth",
+            "stellar_teff_k", "stellar_radius_re", "stellar_mass_sun", "stellar_logg_cgs",
+            "stellar_metallicity_fe", "impact_param", "apparent_mag", "ra", "dec"
+        ]
+
         # Get feature defaults (medians)
         feature_defaults = getattr(predictor, 'imputer', None)
-        # If imputer is a SimpleImputer, get statistics_
         if feature_defaults and hasattr(feature_defaults, 'statistics_'):
             median_map = dict(zip(predictor.feature_columns, feature_defaults.statistics_))
         else:
-            # Fallback to FEATURE_DEFAULTS from config
             from config import FEATURE_DEFAULTS
             median_map = FEATURE_DEFAULTS
 
+        # Map each row to expected features, fill missing with defaults
+        requests = []
         for _, row in df.iterrows():
-            # Convert row to dict
-            data = {col: row.get(col, None) for col in predictor.feature_columns if col != 'mission_encoded'}
-            # Fill missing values with medians/defaults
-            for col in predictor.feature_columns:
-                if col == 'mission_encoded':
-                    continue
-                if data.get(col) is None or (isinstance(data.get(col), float) and pd.isna(data.get(col))):
-                    data[col] = median_map.get(col, 0.0)
-            # Assume 'mission' column exists or set default
-            if 'mission' not in data:
-                data['mission'] = 'KEPLER'
-            req = ExoplanetPredictionRequest(**data)
+            mapped_row = {}
+            for col in expected_features:
+                val = row.get(col, None)
+                # Fill missing/empty values with median/default
+                if val is None or (isinstance(val, float) and pd.isna(val)) or (isinstance(val, str) and val.strip() == ""):
+                    mapped_row[col] = median_map.get(col, 0.0)
+                else:
+                    mapped_row[col] = val
+            # Ensure 'mission' column exists
+            if 'mission' not in mapped_row:
+                mapped_row['mission'] = 'KEPLER'
+            # Only pass required features to ExoplanetPredictionRequest
+            req_data = {k: mapped_row[k] for k in predictor.feature_columns if k != 'mission_encoded' and k in mapped_row}
+            req = ExoplanetPredictionRequest(**req_data)
             requests.append(req)
 
         # Run batch prediction

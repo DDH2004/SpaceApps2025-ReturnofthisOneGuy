@@ -109,8 +109,8 @@ class ExoplanetPredictor:
             features = np.array(feature_vector).reshape(1, -1)
             
             # Apply preprocessing if available
-            if self.preprocessor is not None and hasattr(self.preprocessor, 'transform'):
-                features = self.preprocessor.transform(features)
+            if self.scaler is not None and hasattr(self.scaler, 'transform'):
+                features = self.scaler.transform(features)
             
             return features
             
