@@ -54,6 +54,10 @@ This project implements a **comprehensive exoplanet detection system** combining
 | **Tabular PyTorch** | Deep Learning | 93.6% | 52K | Fast, reliable predictions |
 | **Random Forest** | Ensemble | 85.0% | Variable | Baseline comparison |
 
+##Hybrid Model
+The Hybrid model takes in several factors to determine if there is an exoplanet to reduce false positives. Currently the API was slow and it took me 4 hours to get 200 samples for TPF data so I had limited training data however the results I had were promising and shwed more accuracy and percision if trained with more data.
+
+
 ### Data Processing
 
 - **Sources**: Kepler KOI, TESS TOI candidate data
